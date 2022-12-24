@@ -1,0 +1,4 @@
+
+# Necessary for console-subscriber debugging tool
+[build]
+rustflags = ["--cfg", "tokio_unstable"]

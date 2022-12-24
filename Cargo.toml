@@ -1,0 +1,8 @@
+[workspace]
+members = [
+	"storage/",
+	"transport/",
+	"server/",
+	"client/",
+	"common/",
+]
