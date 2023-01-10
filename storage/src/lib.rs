@@ -12,6 +12,7 @@ use thiserror::Error;
 use zerocopy::{FromBytes, AsBytes, Unaligned, U64};
 use unishare_common::*;
 
+#[derive(Debug)]
 pub struct FsStorage {
 	root: PathBuf,
 	sled: sled::Db,
@@ -36,8 +37,8 @@ impl FsStorage {
 			Some(data.map(|d| d.to_owned()).unwrap_or_else(|| {
 				bincode::serialize(&Metadata {
 					ino: 1,
-					size: 0,
-					name: String::new(),
+					size: 1024,
+					name: String::from("/"),
 					kind: FileType::Directory,
 				}).unwrap()
 			}))

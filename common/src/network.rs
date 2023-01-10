@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use remoc::rch::oneshot::{Sender, Receiver};
+use unishare_transport::{ReplyToken};
 
 use crate::storage::*;
 
@@ -11,13 +11,14 @@ pub enum ServerMessage {
 /// Big request enum
 #[derive(Debug, Serialize, Deserialize, derive_more::From)]
 pub enum ClientMessage {
-	GetMetadata(GetMetadata, Sender<Result<Metadata, GetMetadataError>>),
-	Lookup(Lookup, Sender<Result<Metadata, LookupError>>),
-	Open(Open, Sender<Result<u64, OpenError>>),
-	CreateFile(CreateFile, Sender<Result<(), ()>>),
-	ReadFile(ReadFile, Sender<Result<Vec<u8>, ReadFileError>>),
-	WriteFile(WriteFile, Sender<Result<u64, ()>>),
-	DeleteFile(DeleteFile, Sender<Result<(), ()>>),
+	GetMetadata(GetMetadata, ReplyToken<Result<Metadata, GetMetadataError>>),
+	Lookup(Lookup, ReplyToken<Result<Metadata, LookupError>>),
+	Open(Open, ReplyToken<Result<u64, OpenError>>),
+	CreateFile(CreateFile, ReplyToken<Result<(), ()>>),
+	ReadFile(ReadFile, ReplyToken<Result<Vec<u8>, ReadFileError>>),
+	WriteFile(WriteFile, ReplyToken<Result<u64, ()>>),
+	DeleteFile(DeleteFile, ReplyToken<Result<(), ()>>),
+	ReadDir(ReadDir, ReplyToken<Result<Vec<DirEntry>, ReadDirError>>)
 }
 
 /// 
@@ -82,4 +83,15 @@ pub struct WriteFile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeleteFile {
 	pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadDir {
+	pub ino: u64,
+	pub offset: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ReadDirError {
+	NotFound,
 }

@@ -2,12 +2,15 @@ use std::{net::{SocketAddr}, sync::Arc, path::PathBuf, time::SystemTime};
 
 use anyhow::Context;
 use futures::{lock::Mutex, Future};
+use serde::Serialize;
 use structopt::StructOpt;
 use tokio::net::{TcpListener, TcpStream};
 use unishare_common::*;
 use unishare_storage::FsStorage;
-use remoc::rch::{self, oneshot};
+#[allow(unused_imports)]
 use tracing::{error, warn, info, debug, trace};
+use unishare_transport::{ReplyToken, Sender};
+use guard::guard;
 
 
 #[derive(Debug, StructOpt)]
@@ -61,33 +64,16 @@ async fn server(listener: TcpListener, options: &Options) -> anyhow::Result<()> 
 
 #[tracing::instrument(skip(state, _peer))]
 async fn service(state: Arc<State>, stream: TcpStream, _peer: SocketAddr) -> anyhow::Result<()> {
-	let cfg = remoc::Cfg::default();
-	let (socket_rx, socket_tx) = stream.into_split();
-	let (conn, _tx, mut rx): (_, rch::base::Sender<ServerMessage>, rch::base::Receiver<ClientMessage>)
-		= remoc::Connect::io(cfg, socket_rx, socket_tx).await?;
-	tokio::spawn(conn);
+	let (conn, tx, mut rx) = unishare_transport::Connection::new(stream);
+	tokio::spawn(conn.run());
 	
-	loop {
-		let msg = match rx.recv().await {
-			Ok(t) => t,
-			Err(rch::base::RecvError::Receive(ch)) if ch.is_terminated() => {
-				break;
-			},
-			Err(e) if e.is_final() => {
-				return Err(e.into());
-			},
-			Err(e) => {
-				warn!("Error occurred in service handler: {}", e);
-				continue;
-			},
-		};
-		
+	while let Some(msg) = rx.recv().await {
 		match msg {
-			Some(ClientMessage::GetMetadata(req, rep)) => handle(state.clone(), req, rep, get_metadata).await?,
-			Some(ClientMessage::Lookup(req, rep)) => handle(state.clone(), req, rep, lookup).await?,
-			Some(ClientMessage::Open(req, rep)) => handle(state.clone(), req, rep, open).await?,
-			Some(ClientMessage::ReadFile(req, rep)) => handle(state.clone(), req, rep, read_file).await?,
-			None => break,
+			ClientMessage::GetMetadata(req, rep) => handle(state.clone(), &tx, req, rep, get_metadata).await?,
+			ClientMessage::Lookup(req, rep) => handle(state.clone(), &tx, req, rep, lookup).await?,
+			ClientMessage::Open(req, rep) => handle(state.clone(), &tx, req, rep, open).await?,
+			ClientMessage::ReadFile(req, rep) => handle(state.clone(), &tx, req, rep, read_file).await?,
+			ClientMessage::ReadDir(req, rep) => handle(state.clone(), &tx, req, rep, read_dir).await?,
 			_ => unimplemented!()
 		}
 	}
@@ -95,15 +81,15 @@ async fn service(state: Arc<State>, stream: TcpStream, _peer: SocketAddr) -> any
 	Ok(())
 }
 
-async fn handle<T, U, F: Future<Output=anyhow::Result<U>>>(state: Arc<State>, req: T, rep: oneshot::Sender<U>, f: fn(Arc<State>, req: T) -> F) -> anyhow::Result<()>
+async fn handle<T, U, F: Future<Output=anyhow::Result<U>>>(state: Arc<State>, tx: &Sender<ServerMessage>, req: T, rep: ReplyToken<U>, f: fn(Arc<State>, req: T) -> F) -> anyhow::Result<()>
 where
 	T: std::fmt::Debug,
-	U: remoc::RemoteSend + std::fmt::Debug + Send + Sync
+	U: Serialize + std::fmt::Debug + Send + Sync
 {
 	tracing::debug!(?req, "Handling request");
 	let res = f(state, req).await?;
 	tracing::debug!(?res, "Sending reply");
-	rep.send(res)?;
+	tx.reply(rep, res).await;
 	Ok(())
 }
 
@@ -129,5 +115,26 @@ async fn read_file(state: Arc<State>, req: ReadFile) -> anyhow::Result<Result<Ve
 	match state.storage.lock().await.read_file(req.ino, req.offset, req.size)? {
 		Some(t) => Ok(Ok(t)),
 		None => Ok(Err(ReadFileError::NotFound)),
+	}
+}
+
+async fn read_dir(state: Arc<State>, req: ReadDir) -> anyhow::Result<Result<Vec<DirEntry>, ReadDirError>> {
+	let storage = state.storage.lock().await;
+	match storage.read_directory(req.ino)? {
+		Some(inos) => {
+			let mut ents = Vec::new();
+			for (i, ino) in std::iter::once(req.ino).chain(inos.into_iter()).enumerate().skip(req.offset.try_into().unwrap()) {
+				guard!(let Some(meta) = storage.read_metadata(ino)? else { continue; });
+				ents.push(DirEntry {
+					ino,
+					offset: i.try_into().unwrap(),
+					kind: meta.kind,
+					name: if i == 0 { String::from(".") } else { meta.name },
+				});
+			}
+			Ok(Ok(ents))
+		},
+		None => Ok(Err(ReadDirError::NotFound)),
+		
 	}
 }

@@ -11,67 +11,43 @@ use futures::FutureExt;
 
 #[cfg(test)]
 mod tests;
+//mod queuebuf;
 
 #[derive(Debug)]
-pub struct Message {
+struct Message {
 	id: i64,
 	data: Vec<u8>,
 }
 
-/// Used in conjunction with a Sender to send a reply to a specific receiver
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ReplyToken<T> {
-	id: i64,
-	_phantom: PhantomData<T>,
-}
-
-/// Used to await a reply from a certain token
-pub struct ReplyReceiver<T> {
-	reply_receiver: sync::oneshot::Receiver<Vec<u8>>,
-	_phantom: PhantomData<T>,
-}
-
-impl<T: for<'de> Deserialize<'de>> ReplyReceiver<T> {
-	pub async fn recv(self) -> Option<T> {
-		if let Some(data) = self.reply_receiver.await.ok() {
-			if let Ok(obj) = bincode::deserialize(&data) {
-				Some(obj)
-			} else {
-				tracing::debug!("Deserialization of reply failed");
-				None
-			}
-		} else {
-			None
-		}
-	}
-}
-
 pub struct Connection {
+	/// The bidirectional underlying TcpStream
 	stream: TcpStream,
-	inbound: Vec<u8>,/* 
-	/// Used to send incoming replies to the connection to be distributed to their handlers
-	_incoming_reply_sender: sync::mpsc::Sender<Message>,
-	/// Receives replies from copies of the above sender, then the connection will distribute them
-	incoming_replies: sync::mpsc::Receiver<Message>, */
-	/* /// Used from local sender to send replies to connection to be sent to remote
-	_outgoing_reply_sender: sync::mpsc::Sender<Message>,
-	/// Receives local outgoing replies to be sent across stream
-	outgoing_replies: sync::mpsc::Receiver<Message>, */
-	// This is not necessary to keep here? Except to prevent the channel from closing maybe...
+	/// State shared across Sender objects
+	inner: Arc<SharedState>,
+	/// The buffer of inbound data that may not contain a complete message yet
+	inbound: Vec<u8>,
+	/// A clone of the Sender used locally to send messages to this connection. It is never used
+	/// here directly, but it is still held onto to prevent the Receiver below from closing even
+	/// when all Senders are dropped. This simplifies the implementation slightly.
 	_outgoing_message_sender: sync::mpsc::Sender<Message>,
-	/// Receive outgoing messages from the above sender, then the connection sends them off
+	/// Receives outgoing messages that shall then be sent across the network to the remote endpoint
 	outgoing_messages: sync::mpsc::Receiver<Message>,
-	/// Used to send incoming messages that are not replies to the receiver
+	/// Used to send incoming messages that are not replies to the Receiver
 	incoming_message_sender: sync::mpsc::Sender<Message>,
-	inner: Arc<Conn>,
 }
 
-struct Conn {
+/// State that is synchronized and shared with Sender objects, primarily to facilitate
+/// dispatching replies to the proper ReplyReceiver and properly generating increasing message
+/// ids.
+struct SharedState {
+	/// Mutexed map that relates the id's of replies that are expected to be received to a oneshot
+	/// Sender that will send the message to it's awaiting endpoint once it is received.
 	reply_map: std::sync::Mutex<HashMap<i64, sync::oneshot::Sender<Vec<u8>>>>,
+	/// An incrementing id counter
 	current_id: AtomicI64,
 }
 
-impl Conn {
+impl SharedState {
 	fn next_id(&self) -> i64 {
 		self.current_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
 	}
@@ -79,19 +55,17 @@ impl Conn {
 
 impl Connection {
 	pub fn new<T, U>(stream: TcpStream) -> (Self, Sender<T>, Receiver<U>) {
-		let inner = Arc::new(Conn {
+		let inner = Arc::new(SharedState {
 			current_id: AtomicI64::from(1),
 			reply_map: std::sync::Mutex::new(HashMap::new()),
 		});
 		
-		let (incoming_message_sender, incoming_messages) = sync::mpsc::channel(1024);
-		let (outgoing_message_sender, outgoing_messages) = sync::mpsc::channel(1024);
-		/* let (incoming_reply_sender, incoming_replies) = sync::mpsc::channel::<Message>(1024);
-		let (outgoing_reply_sender, outgoing_replies) = sync::mpsc::channel::<Message>(1024); */
+		// Channels are bounded fairly low to prevent large buildup of requests/replies
+		let (incoming_message_sender, incoming_messages) = sync::mpsc::channel(4);
+		let (outgoing_message_sender, outgoing_messages) = sync::mpsc::channel(4);
 		let sender = Sender {
 			inner: inner.clone(),
 			outgoing_message_sender: outgoing_message_sender.clone(),
-			//outgoing_reply_sender: outgoing_reply_sender.clone(),
 			_phantom: PhantomData,
 		};
 		let receiver = Receiver {
@@ -101,10 +75,6 @@ impl Connection {
 		let this = Self {
 			stream,
 			inbound: Vec::new(),
-			/* _incoming_reply_sender: incoming_reply_sender,
-			incoming_replies, */
-			/* _outgoing_reply_sender: outgoing_reply_sender,
-			outgoing_replies, */
 			_outgoing_message_sender: outgoing_message_sender,
 			outgoing_messages,
 			incoming_message_sender,
@@ -121,6 +91,11 @@ impl Connection {
 				read_res = self.stream.read(&mut buf).fuse() => {
 					match read_res {
 						Ok(n) => {
+							if n == 0 {
+								tracing::debug!("Connection closed");
+								break;
+							}
+							
 							tracing::trace!("Read {n} bytes");
 							self.handle_incoming_bytes(&buf[..n]).await;
 						},
@@ -130,10 +105,6 @@ impl Connection {
 						}
 					}
 				},
-				/* reply = self.incoming_replies.recv().fuse() => {
-					let message = reply.expect("Channel should not be closed");
-					self.handle_incoming_reply(message).await;
-				}, */
 				message = self.outgoing_messages.recv().fuse() => {
 					let message = message.expect("Channel should not be closed");
 					if let Err(_e) = self.send_message(message).await {
@@ -145,14 +116,14 @@ impl Connection {
 		}
 	}
 	
-	pub async fn send_message(&mut self, message: Message) -> std::io::Result<()> {
+	async fn send_message(&mut self, message: Message) -> std::io::Result<()> {
 		self.stream.write_all(&(message.data.len() as u64).to_be_bytes()).await?;
 		self.stream.write_all(&message.id.to_be_bytes()).await?;
 		self.stream.write_all(&message.data).await?;
 		Ok(())
 	}
 	
-	pub async fn handle_incoming_bytes(&mut self, data: &[u8]) {
+	async fn handle_incoming_bytes(&mut self, data: &[u8]) {
 		self.inbound.extend_from_slice(data);
 		loop {
 			// If at least an id and length aren't present
@@ -182,7 +153,7 @@ impl Connection {
 		}
 	}
 	
-	pub async fn handle_incoming_reply(&mut self, msg: Message) {
+	async fn handle_incoming_reply(&mut self, msg: Message) {
 		if let Some(target) = self.inner.reply_map.lock().unwrap().remove(&msg.id) {
 			if let Err(_) = target.send(msg.data) {
 				tracing::debug!("Reply handler was dropped before receiving reply");
@@ -193,31 +164,36 @@ impl Connection {
 
 #[derive(Clone)]
 pub struct Sender<T> {
-	inner: Arc<Conn>,
+	inner: Arc<SharedState>,
 	outgoing_message_sender: sync::mpsc::Sender<Message>,
-	//outgoing_reply_sender: sync::mpsc::Sender<Message>,
 	_phantom: PhantomData<T>,
 }
 
 impl<T: Serialize> Sender<T> {
+	/// Send a message across the network
 	pub async fn send(&self, msg: T) {
 		let id = self.inner.next_id();
 		let data = bincode::serialize(&msg)
 			.expect("Failed to serialize value");
-		self.outgoing_message_sender.send(Message { id, data }).await
-			.expect("Connection closed");
+		if let Err(e) = self.outgoing_message_sender.send(Message { id, data }).await {
+			tracing::error!("Failed to send reply: {e}")
+		}
+			
 	}
 	
+	/// Reply directly to the given ReplyToken
 	pub async fn reply<U: Serialize>(&self, token: ReplyToken<U>, msg: U) {
 		let data = bincode::serialize(&msg)
 			.expect("Failed to serialize value");
-		self.outgoing_message_sender.send(Message { id: token.id, data }).await
-			.expect("Connection closed");
-		/* self.outgoing_reply_sender.send(Message { id: token.id, data }).await
-			.map_err(|_| ())
-			.expect("Connection closed"); */
+		if let Err(e) = self.outgoing_message_sender.send(Message { id: token.id, data }).await {
+			tracing::error!("Failed to send reply: {e}")
+		}
 	}
 	
+	/// Create a request that expects exactly one reply from the remote endpoint The `ReplyToken`
+	/// should be sent to the remote endpoint, and when the remote endpoint sends a reply that
+	/// consumes that token, the result will be sent to the same `ReplyReceiver` that was created
+	/// with the token.
 	pub fn create_request<U: Serialize + for<'de> Deserialize<'de>>(&self) -> (ReplyToken<U>, ReplyReceiver<U>) {
 		let id = -self.inner.next_id();
 		let token = ReplyToken {
@@ -248,6 +224,34 @@ impl<T: for<'de> Deserialize<'de>> Receiver<T> {
 					tracing::warn!("Failed to deserialize response");
 					None
 				}
+			}
+		} else {
+			None
+		}
+	}
+}
+
+/// Used in conjunction with a Sender to send a reply to a specific receiver
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReplyToken<T> {
+	id: i64,
+	_phantom: PhantomData<T>,
+}
+
+/// Used to await a reply from a certain token
+pub struct ReplyReceiver<T> {
+	reply_receiver: sync::oneshot::Receiver<Vec<u8>>,
+	_phantom: PhantomData<T>,
+}
+
+impl<T: for<'de> Deserialize<'de>> ReplyReceiver<T> {
+	pub async fn recv(self) -> Option<T> {
+		if let Some(data) = self.reply_receiver.await.ok() {
+			if let Ok(obj) = bincode::deserialize(&data) {
+				Some(obj)
+			} else {
+				tracing::debug!("Deserialization of reply failed");
+				None
 			}
 		} else {
 			None

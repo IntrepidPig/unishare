@@ -3,7 +3,7 @@
 use thiserror::Error;
 use tracing::{info, warn, error, debug, trace};
 
-use std::{marker::PhantomData, time::{Duration, SystemTime}, os::unix::prelude::OsStrExt};
+use std::{marker::PhantomData, time::{Duration, SystemTime}, os::unix::prelude::OsStrExt, fs::File};
 use unishare_common::storage::*;
 
 pub trait Filesystem {
@@ -11,39 +11,40 @@ pub trait Filesystem {
 	fn lookup(&mut self, parent: u64, name: &str) -> FuseResult<Attr>;
 	fn open(&mut self, ino: u64, flags: i32) -> FuseResult<Opened>;
 	fn read(&mut self, ino: u64, fh: u64, offset: i64, size: u32) -> FuseResult<Vec<u8>>;
+	fn readdir(&mut self, ino: u64, fh: u64, offset: i64) -> FuseResult<Vec<DirEntry>>;
 }
 
 pub struct FilesystemImpl<T>(pub T);
 
 impl<T> fuser::Filesystem for FilesystemImpl<T> where T: Filesystem {
 	fn init(&mut self, _req: &fuser::Request<'_>, _config: &mut fuser::KernelConfig) -> Result<(), libc::c_int> {
-		debug!("[Default Impl] init()");
+		trace!("[Default Impl] init()");
 		Ok(())
 	}
 
 	fn destroy(&mut self) {
-		debug!("[Default Impl] destroy()");
+		trace!("[Default Impl] destroy()");
 	}
 
-	fn lookup(&mut self, _req: &fuser::Request<'_>, parent: u64, name: &std::ffi::OsStr, reply: fuser::ReplyEntry) {
-		debug!(parent, ?name, "LOOKUP");
+	fn lookup(&mut self, req: &fuser::Request<'_>, parent: u64, name: &std::ffi::OsStr, reply: fuser::ReplyEntry) {
+		debug!(parent, ?name, pid = req.pid(), "LOOKUP");
 		match self.0.lookup(parent, std::str::from_utf8(name.as_bytes()).unwrap()) {
-			Ok(t) => reply.entry(&Duration::from_secs(1), &t.into(), 1),
+			Ok(t) => reply.entry(&Duration::from_secs(0), &t.into(), 1),
 			Err(e) => reply.error(e.into()),
 		}
 	}
 
 	fn forget(&mut self, _req: &fuser::Request<'_>, ino: u64, nlookup: u64) {
-		debug!(
+		trace!(
 			"[Not Implemented] forget(ino: {:#x?}, nlookup: {})",
 			ino, nlookup
 		);
 	}
 
-	fn getattr(&mut self, _req: &fuser::Request<'_>, ino: u64, reply: fuser::ReplyAttr) {
-		debug!(ino, "GETATTR");
+	fn getattr(&mut self, req: &fuser::Request<'_>, ino: u64, reply: fuser::ReplyAttr) {
+		debug!(ino, pid = req.pid(), "GETATTR");
 		match self.0.getattr(ino) {
-			Ok(t) => reply.attr(&Duration::from_secs(1), &t.into()),
+			Ok(t) => reply.attr(&Duration::from_secs(0), &t.into()),
 			Err(e) => reply.error(e.into()),
 		}
 	}
@@ -66,17 +67,17 @@ impl<T> fuser::Filesystem for FilesystemImpl<T> where T: Filesystem {
 		flags: Option<u32>,
 		reply: fuser::ReplyAttr,
 	) {
-		debug!(
+		trace!(
 			"[Not Implemented] setattr(ino: {:#x?}, mode: {:?}, uid: {:?}, \
 			gid: {:?}, size: {:?}, fh: {:?}, flags: {:?})",
 			ino, mode, uid, gid, size, fh, flags
 		);
-		reply.error(libc::ENOSYS);
+		reply.error(FuseError::NotImplemented.into());
 	}
 
 	fn readlink(&mut self, _req: &fuser::Request<'_>, ino: u64, reply: fuser::ReplyData) {
-		debug!("[Not Implemented] readlink(ino: {:#x?})", ino);
-		reply.error(libc::ENOSYS);
+		trace!("[Not Implemented] readlink(ino: {:#x?})", ino);
+		reply.error(FuseError::NotImplemented.into());
 	}
 
 	fn mknod(
@@ -89,12 +90,12 @@ impl<T> fuser::Filesystem for FilesystemImpl<T> where T: Filesystem {
 		rdev: u32,
 		reply: fuser::ReplyEntry,
 	) {
-		debug!(
+		trace!(
 			"[Not Implemented] mknod(parent: {:#x?}, name: {:?}, mode: {}, \
 			umask: {:#x?}, rdev: {})",
 			parent, name, mode, umask, rdev
 		);
-		reply.error(libc::ENOSYS);
+		reply.error(FuseError::NotImplemented.into());
 	}
 
 	fn mkdir(
@@ -106,27 +107,27 @@ impl<T> fuser::Filesystem for FilesystemImpl<T> where T: Filesystem {
 		umask: u32,
 		reply: fuser::ReplyEntry,
 	) {
-		debug!(
+		trace!(
 			"[Not Implemented] mkdir(parent: {:#x?}, name: {:?}, mode: {}, umask: {:#x?})",
 			parent, name, mode, umask
 		);
-		reply.error(libc::ENOSYS);
+		reply.error(FuseError::NotImplemented.into());
 	}
 
 	fn unlink(&mut self, _req: &fuser::Request<'_>, parent: u64, name: &std::ffi::OsStr, reply: fuser::ReplyEmpty) {
-		debug!(
+		trace!(
 			"[Not Implemented] unlink(parent: {:#x?}, name: {:?})",
 			parent, name,
 		);
-		reply.error(libc::ENOSYS);
+		reply.error(FuseError::NotImplemented.into());
 	}
 
 	fn rmdir(&mut self, _req: &fuser::Request<'_>, parent: u64, name: &std::ffi::OsStr, reply: fuser::ReplyEmpty) {
-		debug!(
+		trace!(
 			"[Not Implemented] rmdir(parent: {:#x?}, name: {:?})",
 			parent, name,
 		);
-		reply.error(libc::ENOSYS);
+		reply.error(FuseError::NotImplemented.into());
 	}
 
 	fn symlink(
@@ -137,7 +138,7 @@ impl<T> fuser::Filesystem for FilesystemImpl<T> where T: Filesystem {
 		link: &std::path::Path,
 		reply: fuser::ReplyEntry,
 	) {
-		debug!(
+		trace!(
 			"[Not Implemented] symlink(parent: {:#x?}, name: {:?}, link: {:?})",
 			parent, name, link,
 		);
@@ -154,12 +155,12 @@ impl<T> fuser::Filesystem for FilesystemImpl<T> where T: Filesystem {
 		flags: u32,
 		reply: fuser::ReplyEmpty,
 	) {
-		debug!(
+		trace!(
 			"[Not Implemented] rename(parent: {:#x?}, name: {:?}, newparent: {:#x?}, \
 			newname: {:?}, flags: {})",
 			parent, name, newparent, newname, flags,
 		);
-		reply.error(libc::ENOSYS);
+		reply.error(FuseError::NotImplemented.into());
 	}
 
 	fn link(
@@ -170,7 +171,7 @@ impl<T> fuser::Filesystem for FilesystemImpl<T> where T: Filesystem {
 		newname: &std::ffi::OsStr,
 		reply: fuser::ReplyEntry,
 	) {
-		debug!(
+		trace!(
 			"[Not Implemented] link(ino: {:#x?}, newparent: {:#x?}, newname: {:?})",
 			ino, newparent, newname
 		);
@@ -215,7 +216,7 @@ impl<T> fuser::Filesystem for FilesystemImpl<T> where T: Filesystem {
 		lock_owner: Option<u64>,
 		reply: fuser::ReplyWrite,
 	) {
-		debug!(
+		trace!(
 			"[Not Implemented] write(ino: {:#x?}, fh: {}, offset: {}, data.len(): {}, \
 			write_flags: {:#x?}, flags: {:#x?}, lock_owner: {:?})",
 			ino,
@@ -226,15 +227,15 @@ impl<T> fuser::Filesystem for FilesystemImpl<T> where T: Filesystem {
 			flags,
 			lock_owner
 		);
-		reply.error(libc::ENOSYS);
+		reply.error(FuseError::NotImplemented.into());
 	}
 
 	fn flush(&mut self, _req: &fuser::Request<'_>, ino: u64, fh: u64, lock_owner: u64, reply: fuser::ReplyEmpty) {
-		debug!(
+		trace!(
 			"[Not Implemented] flush(ino: {:#x?}, fh: {}, lock_owner: {:?})",
 			ino, fh, lock_owner
 		);
-		reply.error(libc::ENOSYS);
+		reply.error(FuseError::NotImplemented.into());
 	}
 
 	fn release(
@@ -251,19 +252,20 @@ impl<T> fuser::Filesystem for FilesystemImpl<T> where T: Filesystem {
 	}
 
 	fn fsync(&mut self, _req: &fuser::Request<'_>, ino: u64, fh: u64, datasync: bool, reply: fuser::ReplyEmpty) {
-		debug!(
+		trace!(
 			"[Not Implemented] fsync(ino: {:#x?}, fh: {}, datasync: {})",
 			ino, fh, datasync
 		);
-		reply.error(libc::ENOSYS);
+		reply.error(FuseError::NotImplemented.into());
 	}
 
 	fn opendir(&mut self, _req: &fuser::Request<'_>, ino: u64, flags: i32, reply: fuser::ReplyOpen) {
-		debug!(
+		trace!(
 			"[Default Impl] opendir(ino: {:#x?}, flags: {})",
 			ino, flags
 		);
-		reply.opened(0, 0);
+		reply.error(FuseError::NotImplemented.into());
+		//reply.opened(0, 0);
 	}
 
 	fn readdir(
@@ -272,13 +274,20 @@ impl<T> fuser::Filesystem for FilesystemImpl<T> where T: Filesystem {
 		ino: u64,
 		fh: u64,
 		offset: i64,
-		reply: fuser::ReplyDirectory,
+		mut reply: fuser::ReplyDirectory,
 	) {
-		warn!(
-			"[Not Implemented] readdir(ino: {:#x?}, fh: {}, offset: {})",
-			ino, fh, offset
-		);
-		reply.error(libc::ENOSYS);
+		debug!(ino, fh, offset, "READDIR");
+		match self.0.readdir(ino, fh, offset) {
+			Ok(ents) => {
+				for ent in ents {
+					if reply.add(ent.ino, ent.offset, convert_file_type(ent.kind), &ent.name) {
+						break;
+					}
+				}
+				reply.ok();
+			},
+			Err(e) => reply.error(e.into()),
+		}
 	}
 
 	fn readdirplus(
@@ -289,11 +298,11 @@ impl<T> fuser::Filesystem for FilesystemImpl<T> where T: Filesystem {
 		offset: i64,
 		reply: fuser::ReplyDirectoryPlus,
 	) {
-		debug!(
+		trace!(
 			"[Not Implemented] readdirplus(ino: {:#x?}, fh: {}, offset: {})",
 			ino, fh, offset
 		);
-		reply.error(libc::ENOSYS);
+		reply.error(FuseError::NotImplemented.into());
 	}
 
 	fn releasedir(
@@ -304,7 +313,7 @@ impl<T> fuser::Filesystem for FilesystemImpl<T> where T: Filesystem {
 		flags: i32,
 		reply: fuser::ReplyEmpty,
 	) {
-		debug!(
+		trace!(
 			"[Default Impl] releasedir(ino: {:#x?}, fh: {}, flags: {})",
 			ino, fh, flags
 		);
@@ -319,20 +328,21 @@ impl<T> fuser::Filesystem for FilesystemImpl<T> where T: Filesystem {
 		datasync: bool,
 		reply: fuser::ReplyEmpty,
 	) {
-		debug!(
-			"[Not Implemented] fsyncdir(ino: {:#x?}, fh: {}, datasync: {})",
+		trace!(
+			"[Default Impl] fsyncdir(ino: {:#x?}, fh: {}, datasync: {})",
 			ino, fh, datasync
 		);
-		reply.error(libc::ENOSYS);
+		reply.ok();
+		//reply.error(FuseError::NotImplemented.into());
 	}
 
 	fn statfs(&mut self, _req: &fuser::Request<'_>, ino: u64, reply: fuser::ReplyStatfs) {
-		debug!(
+		trace!(
 			"[Not Implemented] statfs(ino: {:#x?})",
 			ino,
 		);
-		//reply.statfs(0, 0, 0, 0, 0, 512, 255, 0);
-		reply.error(libc::ENOSYS);
+		reply.statfs(0, 0, 0, 0, 0, 512, 255, 0);
+		//reply.error(FuseError::NotImplemented.into());
 	}
 
 	fn setxattr(
@@ -349,7 +359,7 @@ impl<T> fuser::Filesystem for FilesystemImpl<T> where T: Filesystem {
 			"[Not Implemented] setxattr(ino: {:#x?}, name: {:?}, flags: {:#x?}, position: {})",
 			ino, name, flags, position
 		);
-		reply.error(libc::ENOSYS);
+		reply.error(FuseError::NotImplemented.into());
 	}
 
 	fn getxattr(
@@ -360,27 +370,27 @@ impl<T> fuser::Filesystem for FilesystemImpl<T> where T: Filesystem {
 		size: u32,
 		reply: fuser::ReplyXattr,
 	) {
-		debug!(
+		trace!(
 			"[Not Implemented] getxattr(ino: {:#x?}, name: {:?}, size: {})",
 			ino, name, size
 		);
-		reply.error(libc::ENOSYS);
+		reply.error(FuseError::NotImplemented.into());
 	}
 
 	fn listxattr(&mut self, _req: &fuser::Request<'_>, ino: u64, size: u32, reply: fuser::ReplyXattr) {
-		debug!(
+		trace!(
 			"[Not Implemented] listxattr(ino: {:#x?}, size: {})",
 			ino, size
 		);
-		reply.error(libc::ENOSYS);
+		reply.error(FuseError::NotImplemented.into());
 	}
 
 	fn removexattr(&mut self, _req: &fuser::Request<'_>, ino: u64, name: &std::ffi::OsStr, reply: fuser::ReplyEmpty) {
-		debug!(
+		trace!(
 			"[Not Implemented] removexattr(ino: {:#x?}, name: {:?})",
 			ino, name
 		);
-		reply.error(libc::ENOSYS);
+		reply.error(FuseError::NotImplemented.into());
 	}
 	
 	/// This is the same as the access(2) system call. It returns -ENOENT if the path doesn't exist,
@@ -388,9 +398,9 @@ impl<T> fuser::Filesystem for FilesystemImpl<T> where T: Filesystem {
 	/// called on files, directories, or any other object that appears in the filesystem. This call
 	/// is not required but is highly recommended. 
 	fn access(&mut self, _req: &fuser::Request<'_>, ino: u64, mask: i32, reply: fuser::ReplyEmpty) {
-		debug!("[Default Impl] access(ino: {:#x?}, mask: {})", ino, mask);
+		trace!("[Default Impl] access(ino: {:#x?}, mask: {})", ino, mask);
 		//debug!("[Not Implemented] access(ino: {:#x?}, mask: {})", ino, mask);
-		//reply.error(libc::ENOSYS);
+		//reply.error(FuseError::NotImplemented.into());
 		// TODO: actually check access
 		reply.ok();
 	}
@@ -405,12 +415,12 @@ impl<T> fuser::Filesystem for FilesystemImpl<T> where T: Filesystem {
 		flags: i32,
 		reply: fuser::ReplyCreate,
 	) {
-		debug!(
+		trace!(
 			"[Not Implemented] create(parent: {:#x?}, name: {:?}, mode: {}, umask: {:#x?}, \
 			flags: {:#x?})",
 			parent, name, mode, umask, flags
 		);
-		reply.error(libc::ENOSYS);
+		reply.error(FuseError::NotImplemented.into());
 	}
 
 	fn getlk(
@@ -425,12 +435,12 @@ impl<T> fuser::Filesystem for FilesystemImpl<T> where T: Filesystem {
 		pid: u32,
 		reply: fuser::ReplyLock,
 	) {
-		debug!(
+		trace!(
 			"[Not Implemented] getlk(ino: {:#x?}, fh: {}, lock_owner: {}, start: {}, \
 			end: {}, typ: {}, pid: {})",
 			ino, fh, lock_owner, start, end, typ, pid
 		);
-		reply.error(libc::ENOSYS);
+		reply.error(FuseError::NotImplemented.into());
 	}
 
 	fn setlk(
@@ -446,20 +456,20 @@ impl<T> fuser::Filesystem for FilesystemImpl<T> where T: Filesystem {
 		sleep: bool,
 		reply: fuser::ReplyEmpty,
 	) {
-		debug!(
+		trace!(
 			"[Not Implemented] setlk(ino: {:#x?}, fh: {}, lock_owner: {}, start: {}, \
 			end: {}, typ: {}, pid: {}, sleep: {})",
 			ino, fh, lock_owner, start, end, typ, pid, sleep
 		);
-		reply.error(libc::ENOSYS);
+		reply.error(FuseError::NotImplemented.into());
 	}
 
 	fn bmap(&mut self, _req: &fuser::Request<'_>, ino: u64, blocksize: u32, idx: u64, reply: fuser::ReplyBmap) {
-		debug!(
+		trace!(
 			"[Not Implemented] bmap(ino: {:#x?}, blocksize: {}, idx: {})",
 			ino, blocksize, idx,
 		);
-		reply.error(libc::ENOSYS);
+		reply.error(FuseError::NotImplemented.into());
 	}
 
 	fn ioctl(
@@ -473,7 +483,7 @@ impl<T> fuser::Filesystem for FilesystemImpl<T> where T: Filesystem {
 		out_size: u32,
 		reply: fuser::ReplyIoctl,
 	) {
-		debug!(
+		trace!(
 			"[Not Implemented] ioctl(ino: {:#x?}, fh: {}, flags: {}, cmd: {}, \
 			in_data.len(): {}, out_size: {})",
 			ino,
@@ -483,7 +493,7 @@ impl<T> fuser::Filesystem for FilesystemImpl<T> where T: Filesystem {
 			in_data.len(),
 			out_size,
 		);
-		reply.error(libc::ENOSYS);
+		reply.error(FuseError::NotImplemented.into());
 	}
 
 	fn fallocate(
@@ -496,12 +506,12 @@ impl<T> fuser::Filesystem for FilesystemImpl<T> where T: Filesystem {
 		mode: i32,
 		reply: fuser::ReplyEmpty,
 	) {
-		debug!(
+		trace!(
 			"[Not Implemented] fallocate(ino: {:#x?}, fh: {}, offset: {}, \
 			length: {}, mode: {})",
 			ino, fh, offset, length, mode
 		);
-		reply.error(libc::ENOSYS);
+		reply.error(FuseError::NotImplemented.into());
 	}
 
 	fn lseek(
@@ -513,11 +523,11 @@ impl<T> fuser::Filesystem for FilesystemImpl<T> where T: Filesystem {
 		whence: i32,
 		reply: fuser::ReplyLseek,
 	) {
-		debug!(
+		trace!(
 			"[Not Implemented] lseek(ino: {:#x?}, fh: {}, offset: {}, whence: {})",
 			ino, fh, offset, whence
 		);
-		reply.error(libc::ENOSYS);
+		reply.error(FuseError::NotImplemented.into());
 	}
 
 	fn copy_file_range(
@@ -533,13 +543,13 @@ impl<T> fuser::Filesystem for FilesystemImpl<T> where T: Filesystem {
 		flags: u32,
 		reply: fuser::ReplyWrite,
 	) {
-		debug!(
+		trace!(
 			"[Not Implemented] copy_file_range(ino_in: {:#x?}, fh_in: {}, \
 			offset_in: {}, ino_out: {:#x?}, fh_out: {}, offset_out: {}, \
 			len: {}, flags: {})",
 			ino_in, fh_in, offset_in, ino_out, fh_out, offset_out, len, flags
 		);
-		reply.error(libc::ENOSYS);
+		reply.error(FuseError::NotImplemented.into());
 	}
 }
 
@@ -552,6 +562,8 @@ pub enum FuseError {
 	NotFound,
 	#[error("Data communication failed")]
 	Transport,
+	#[error("Function not implemented")]
+	NotImplemented,
 	#[error("Unknown error")]
 	Other,
 }
@@ -561,11 +573,11 @@ impl From<FuseError> for libc::c_int {
         match t {
 			FuseError::NotFound => libc::ENOENT,
             FuseError::Transport => libc::EPIPE,
+			FuseError::NotImplemented => libc::ENOSYS,
             FuseError::Other => libc::EINVAL,
 		}
     }
 }
-
 
 pub struct Attr {
 	pub ino: u64,

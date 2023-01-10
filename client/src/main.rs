@@ -1,12 +1,13 @@
 use std::{path::PathBuf, sync::Arc, collections::HashMap, time::Duration};
 
+use serde::{Serialize, Deserialize};
 use fuse::{FuseResult, FuseError};
 use libc::ENOENT;
 use remoc::rch::{self, oneshot};
 use structopt::StructOpt;
 use tokio::net::TcpStream;
 use unishare_common::*;
-
+use unishare_transport::ReplyToken;
 pub mod fuse;
 
 #[derive(Debug, StructOpt)]
@@ -39,19 +40,18 @@ impl Fuse {
 	/// be called from within a tokio context.
 	pub fn request<R, T>(&mut self, request: R) -> Result<T, RequestError>
 	where
-		T: remoc::rtc::Serialize + for<'de> remoc::rtc::Deserialize<'de> + Send + 'static + std::fmt::Debug,
-		ClientMessage: From<(R, oneshot::Sender<T>)>,
+		T: Serialize + for<'de> Deserialize<'de> + Send + 'static + std::fmt::Debug,
+		ClientMessage: From<(R, ReplyToken<T>)>,
 	{
 		let rt = tokio::runtime::Handle::current();
-		let (tx, rx) = oneshot::channel();
-		let full_request = ClientMessage::from((request, tx));
+		let (token, receiver) = self.conn.tx.create_request();
+		let full_request = ClientMessage::from((request, token));
 		rt.block_on(async move {
 			let span = tracing::span!(tracing::Level::DEBUG, "Request");
 			let _guard = span.enter();
 			tracing::debug!(?full_request, "Sending request");
-			self.conn.tx.send(full_request).await
-				.map_err(rch::base::SendError::without_item)?;
-			let reply = rx.await?;
+			self.conn.tx.send(full_request).await;
+			let reply = receiver.recv().await.ok_or(RequestError::NoReply)?;
 			tracing::debug!(?reply, "Got reply");
 			
 			Ok(reply)
@@ -62,10 +62,8 @@ impl Fuse {
 /// Possible transport-level errors that can occur when sending a request
 #[derive(Debug, thiserror::Error)]
 pub enum RequestError {
-	#[error(transparent)]
-	SendError(#[from] rch::base::SendError<()>),
-	#[error(transparent)]
-	RecvError(#[from] rch::oneshot::RecvError),
+	#[error("Reply not received")]
+	NoReply,
 }
 
 impl From<RequestError> for fuse::FuseError {
@@ -103,11 +101,19 @@ impl fuse::Filesystem for Fuse {
 			Err(ReadFileError::NotFound) => Err(FuseError::NotFound),
 		}
 	}
+
+	fn readdir(&mut self, ino: u64, _fh: u64, offset: i64) -> FuseResult<Vec<DirEntry>> {
+		let req = ReadDir { ino, offset };
+		match self.request(req)? {
+			Ok(t) => Ok(t),
+			Err(ReadDirError::NotFound) => Err(FuseError::NotFound),
+		}
+	}
 }
 
 pub struct Connection {
-	tx: rch::base::Sender<ClientMessage>,
-	rx: rch::base::Receiver<ServerMessage>,
+	tx: unishare_transport::Sender<ClientMessage>,
+	rx: unishare_transport::Receiver<ServerMessage>,
 }
 
 #[tokio::main(worker_threads = 4)]
@@ -130,19 +136,12 @@ async fn main() -> anyhow::Result<()> {
 	});
 	
 	let stream = TcpStream::connect(options.host).await?;
-	let cfg = remoc::Cfg::default();
-	let (socket_rx, socket_tx) = stream.into_split();
-	let (conn, tx, rx): (_, rch::base::Sender<ClientMessage>, rch::base::Receiver<ServerMessage>)
-		= remoc::Connect::io(cfg, socket_rx, socket_tx).await?;
-	tokio::spawn(conn);
+	let (connection, sender, receiver) = unishare_transport::Connection::new(stream);
+	tokio::spawn(connection.run());
 	
-	let conn = Connection {
-		tx,
-		rx,
-	};
-	let fuse = Fuse::new(conn);
+	let fuse = Fuse::new(Connection { tx: sender, rx: receiver });
 	
-	tokio::task::spawn_blocking(move || fuser::mount2(fuse::FilesystemImpl(fuse), &options.mount, &[])).await??;
+	tokio::task::spawn_blocking(move || fuser::mount2(fuse::FilesystemImpl(fuse), &options.mount, &[fuser::MountOption::Sync, fuser::MountOption::CUSTOM(String::from("debug"))])).await??;
 	
 	Ok(())
 }

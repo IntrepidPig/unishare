@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 unishare-storage = { path = "../storage" }
 unishare-common = { path = "../common" }
+unishare-transport = { path = "../transport" }
 structopt = "0.3.26"
 bincode = "1.3.3"
 serde = "1.0.136"

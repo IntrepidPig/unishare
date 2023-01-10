@@ -1,5 +1,5 @@
-#export RUST_LOG := "info,server=trace,client=trace,storage=trace,common=trace"
-export RUST_LOG := "trace"
+export RUST_LOG := "info,server=trace,client=trace,unishare_transport=trace"
+#export RUST_LOG := "trace"
 
 build:
 	cargo build
@@ -32,3 +32,7 @@ debug-test-client:
 	cargo build --bin client
 	rust-gdb -ex 'run' --args ./target/debug/client localhost:2048 ./client/mnt
 	sudo umount ./client/mnt
+
+clean-test-data:
+	sudo umount ./client/mnt || true
+	rm -r ./storage/test.storage

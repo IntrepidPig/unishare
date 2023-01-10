@@ -13,3 +13,11 @@ pub enum FileType {
 	Directory,
 	Regular,
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DirEntry {
+	pub ino: u64,
+	pub offset: i64,
+	pub kind: FileType,
+	pub name: String,
+}
