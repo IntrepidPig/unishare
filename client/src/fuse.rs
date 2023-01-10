@@ -590,7 +590,7 @@ impl From<Attr> for fuser::FileAttr {
 			ctime: SystemTime::UNIX_EPOCH,
 			crtime: SystemTime::UNIX_EPOCH,
 			kind: convert_file_type(attr.kind),
-			perm: if attr.kind == FileType::Regular { 0o0040000 | 0o644 } else { 0o0100000 | 0o755 },
+			perm: file_type_to_mode(attr.kind) | file_type_default_perms(attr.kind),
 			nlink: 0,
 			uid: 65535,
 			gid: 65535,
@@ -606,6 +606,20 @@ fn convert_file_type(t: FileType) -> fuser::FileType {
 	match t {
 		FileType::Directory => fuser::FileType::Directory,
 		FileType::Regular => fuser::FileType::RegularFile,
+	}
+}
+
+fn file_type_to_mode(t: FileType) -> u16 {
+	match t {
+		FileType::Regular => 0o0100000,
+		FileType::Directory => 0o0040000,
+	}
+}
+
+fn file_type_default_perms(t: FileType) -> u16 {
+	match t {
+		FileType::Regular => 0o644,
+		FileType::Directory => 0o755,
 	}
 }
 
